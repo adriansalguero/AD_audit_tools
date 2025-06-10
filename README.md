@@ -1,288 +1,302 @@
-# AD_audit_tools
+# Security Checks Documentation
 
-# Invoke-ADSecurityAudit.ps1
+This document provides detailed technical information about each security check performed by the AD Security Audit tool, including the underlying vulnerabilities, detection methods, and risk assessments.
 
-## Overview
+## Table of Contents
 
-The `Invoke-ADSecurityAudit.ps1` script is a comprehensive Active Directory security assessment tool that identifies common misconfigurations and vulnerabilities that could lead to domain compromise.
+1. [Old Password Detection](#old-password-detection)
+2. [Kerberoasting Vulnerability Assessment](#kerberoasting-vulnerability-assessment)
+3. [Privileged Group Auditing](#privileged-group-auditing)
+4. [LDAP NULL Bind Testing](#ldap-null-bind-testing)
+5. [Password Exposure in Descriptions](#password-exposure-in-descriptions)
+6. [SYSVOL Password Analysis](#sysvol-password-analysis)
 
-## Synopsis
+---
 
+## Old Password Detection
+
+### Overview
+Identifies user accounts with passwords that exceed the configured age threshold, indicating potential security risks from stale or compromised credentials.
+
+### Technical Details
+
+#### LDAP Query
 ```powershell
-Invoke-ADSecurityAudit.ps1 
-    [-CheckType <String[]>] 
-    [-PasswordAge <Int32>] 
-    [-PrivilegedGroupThreshold <Int32>] 
-    [-OutputPath <String>] 
-    [-Interactive] 
-    [-ShowProgress]
+Get-ADUser -Filter {Enabled -eq $true} -Properties PasswordLastSet, PasswordNeverExpires, LastLogonDate
 ```
 
-## Description
+#### Detection Logic
+- Filters enabled user accounts only
+- Excludes accounts with `PasswordNeverExpires` set to true
+- Compares `PasswordLastSet` attribute against threshold date
+- Sorts results by password age (oldest first)
 
-This script performs six critical security checks against Active Directory environments:
+#### Risk Assessment
+| Risk Level | Criteria | Impact |
+|------------|----------|--------|
+| **Critical** | Password >180 days old | High likelihood of compromise |
+| **High** | Password >120 days old | Increased vulnerability window |
+| **Medium** | Password >90 days old | Standard policy violation |
+| **Low** | Password >60 days old | Early warning indicator |
 
-1. **Old Password Detection** - Identifies accounts with passwords exceeding age thresholds
-2. **Kerberoasting Vulnerability Assessment** - Detects service accounts susceptible to Kerberoasting attacks
-3. **Privileged Group Auditing** - Reviews membership in high-privilege Active Directory groups
-4. **LDAP NULL Bind Testing** - Checks for anonymous LDAP access vulnerabilities
-5. **Password Exposure in Descriptions** - Scans user description fields for exposed credentials
-6. **SYSVOL Password Analysis** - Searches SYSVOL files for hardcoded passwords
+### Security Implications
 
-## Parameters
+**Attack Vectors:**
+- Password spraying attacks against old passwords
+- Credential stuffing using leaked password databases
+- Social engineering targeting users with old passwords
+- Brute force attacks with higher success probability
 
-### CheckType
-- **Type**: String[]
-- **Default**: All
-- **Valid Values**: All, OldPasswords, Kerberoasting, PrivilegedGroups, LDAPNullBind, PasswordsInDescription, PasswordsInSYSVOL
-- **Description**: Specifies which security checks to perform
+**Business Impact:**
+- Unauthorized access to user accounts
+- Lateral movement within the network
+- Data exfiltration or destruction
+- Compliance violations (SOX, HIPAA, PCI-DSS)
 
-### PasswordAge
-- **Type**: Int32
-- **Default**: 90
-- **Range**: 1-365
-- **Description**: Password age threshold in days for old password detection
+### Remediation Priority
+🔴 **High Priority** - Passwords >120 days should be reset immediately
 
-### PrivilegedGroupThreshold
-- **Type**: Int32
-- **Default**: 5
-- **Range**: 1-50
-- **Description**: Maximum number of members allowed in privileged groups before flagging
+---
 
-### OutputPath
-- **Type**: String
-- **Default**: None
-- **Description**: File path to save audit results in JSON format
-- **Validation**: Parent directory must exist
+## Kerberoasting Vulnerability Assessment
 
-### Interactive
-- **Type**: Switch
-- **Default**: False
-- **Description**: Enables interactive mode with user prompts for each check
+### Overview
+Detects service accounts configured with Service Principal Names (SPNs) that are vulnerable to Kerberoasting attacks, where attackers can extract and crack service account passwords offline.
 
-### ShowProgress
-- **Type**: Switch
-- **Default**: True
-- **Description**: Controls display of progress bars during execution
+### Technical Details
 
-## Examples
-
-### Example 1: Basic Audit
+#### LDAP Query
 ```powershell
-.\Invoke-ADSecurityAudit.ps1
+Get-ADUser -Filter {ServicePrincipalName -ne $null} -Properties ServicePrincipalName, PasswordLastSet, Enabled
 ```
-Runs all security checks with default parameters in non-interactive mode.
 
-### Example 2: Targeted Assessment
+#### Detection Logic
+- Identifies all user accounts with SPNs configured
+- Checks if accounts are enabled
+- Analyzes password age for enabled service accounts
+- Lists all SPNs associated with each account
+
+#### Vulnerability Scoring
+| Score | Criteria | Risk Level |
+|-------|----------|------------|
+| **10** | Enabled + Password never set | Critical |
+| **9** | Enabled + Password >365 days | Critical |
+| **8** | Enabled + Password >180 days | High |
+| **6** | Enabled + Password >90 days | Medium |
+| **3** | Disabled account with SPN | Low |
+
+### Attack Methodology
+
+**Kerberoasting Process:**
+1. **Discovery**: Attacker enumerates SPNs using tools like `setspn` or `PowerView`
+2. **Request**: Requests Kerberos service tickets (TGS) for identified SPNs
+3. **Extraction**: Extracts encrypted password hash from TGS tickets
+4. **Cracking**: Performs offline password cracking using tools like Hashcat
+5. **Access**: Uses cracked credentials for lateral movement
+
+**Common Tools:**
+- Rubeus
+- Invoke-Kerberoast
+- GetUserSPNs.py (Impacket)
+- Hashcat for offline cracking
+
+### Security Implications
+
+**Attack Scenarios:**
+- Service account compromise leading to application access
+- Database server compromise via SQL service accounts
+- File server access through backup service accounts
+- Web application compromise via IIS service accounts
+
+**Detection Challenges:**
+- Kerberos ticket requests appear legitimate
+- No authentication failures generated
+- Difficult to distinguish from normal service requests
+
+### Remediation Priority
+🔴 **Critical Priority** - All enabled service accounts with SPNs require immediate attention
+
+---
+
+## Privileged Group Auditing
+
+### Overview
+Reviews membership in high-privilege Active Directory groups to identify excessive access rights and potential security risks from over-privileged accounts.
+
+### Technical Details
+
+#### Monitored Groups
 ```powershell
-.\Invoke-ADSecurityAudit.ps1 -CheckType OldPasswords,Kerberoasting -PasswordAge 120
+$privilegedGroups = @(
+    'Domain Admins',        # Full domain control
+    'Enterprise Admins',    # Forest-wide control
+    'Schema Admins',        # Schema modification rights
+    'Administrators',       # Local admin on DCs
+    'Account Operators',    # User/group management
+    'Server Operators',     # Server management
+    'Print Operators',      # Print server management
+    'Backup Operators'      # Backup/restore rights
+)
 ```
-Performs only password age and Kerberoasting checks with a 120-day password threshold.
 
-### Example 3: Interactive Mode with Export
+#### Analysis Criteria
+- Member count exceeding configured threshold
+- Enabled vs disabled account status
+- Last logon date analysis
+- Nested group membership evaluation
+
+#### Risk Matrix
+| Group | Max Recommended | Typical Risk |
+|-------|-----------------|--------------|
+| Domain Admins | 2-3 | Critical |
+| Enterprise Admins | 1-2 | Critical |
+| Schema Admins | 1 | High |
+| Administrators | 3-5 | High |
+| Account Operators | 5-10 | Medium |
+| Server Operators | 5-10 | Medium |
+
+### Security Implications
+
+**Over-Privileged Risks:**
+- Increased attack surface for privilege escalation
+- Higher likelihood of insider threats
+- Difficulty in access control management
+- Compliance violations
+
+**Attack Scenarios:**
+- Compromise of over-privileged service accounts
+- Insider threat with excessive permissions
+- Credential theft targeting high-value accounts
+- Lateral movement using privileged credentials
+
+### Remediation Priority
+🟡 **Medium Priority** - Review and reduce membership systematically
+
+---
+
+## LDAP NULL Bind Testing
+
+### Overview
+Tests for the ability to perform anonymous LDAP binds against domain controllers, which can expose directory information to unauthenticated users.
+
+### Technical Details
+
+#### Test Methodology
 ```powershell
-.\Invoke-ADSecurityAudit.ps1 -Interactive -OutputPath "C:\Audit\AD-Security-Report.json" -Verbose
+$ldapPath = "LDAP://$env:USERDNSDOMAIN"
+$anonymousEntry = New-Object System.DirectoryServices.DirectoryEntry($ldapPath)
+$schemaContext = $anonymousEntry.SchemaEntry
 ```
-Runs in interactive mode, saves results to JSON, and provides verbose output.
 
-### Example 4: Privileged Group Focus
+#### Detection Logic
+- Creates DirectoryEntry without credentials
+- Attempts to access schema information
+- Tests read access to directory objects
+- Evaluates anonymous query capabilities
+
+#### Vulnerability Assessment
+| Access Level | Risk | Impact |
+|--------------|------|--------|
+| Full Directory Read | Critical | Complete information disclosure |
+| Schema Access Only | High | Structure enumeration possible |
+| Limited Object Access | Medium | Partial information disclosure |
+| No Anonymous Access | Secure | Proper configuration |
+
+### Security Implications
+
+**Information Disclosure:**
+- User account enumeration
+- Group membership discovery
+- Organizational unit structure
+- Computer account information
+- Service account identification
+
+**Attack Enhancement:**
+- Reconnaissance for targeted attacks
+- Username harvesting for password spraying
+- Service discovery for lateral movement
+- Infrastructure mapping
+
+### Remediation Priority
+🟡 **Medium Priority** - Disable unless specifically required for applications
+
+---
+
+## Password Exposure in Descriptions
+
+### Overview
+Scans Active Directory user description fields for potential password exposure using advanced pattern matching to identify various password formats and obfuscation attempts.
+
+### Technical Details
+
+#### Pattern Detection
+```regex
+# Standard formats
+(?i)password\s*[:=]\s*\S+
+(?i)pwd\s*[:=]\s*\S+
+(?i)pass\s*[:=]\s*\S+
+
+# Obfuscated formats
+(?i)p@ssw[0o]rd\s*[:=]\s*\S+
+
+# Complex passwords
+\b[A-Za-z0-9!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]{8,}\b(?=.*[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?])
+```
+
+#### Analysis Process
+1. Retrieve all enabled users with populated descriptions
+2. Apply pattern matching against description content
+3. Score matches based on complexity and format
+4. Generate detailed findings with context
+
+#### Risk Classification
+| Pattern Type | Risk Level | Example |
+|--------------|------------|---------|
+| Explicit Password | Critical | "password=MyPass123" |
+| Common Abbreviations | High | "pwd: TempPassword" |
+| Obfuscated Text | Medium | "p@ssw0rd = SecretValue" |
+| Complex Strings | Low | Random character sequences |
+
+### Security Implications
+
+**Immediate Risks:**
+- Direct credential exposure
+- Password pattern analysis
+- Dictionary attack vectors
+- Social engineering intelligence
+
+**Compliance Issues:**
+- Data protection violations
+- Audit finding escalation  
+- Regulatory non-compliance
+- Policy violation documentation
+
+### Remediation Priority
+🔴 **Critical Priority** - Immediate removal and password reset required
+
+---
+
+## SYSVOL Password Analysis
+
+### Overview
+Searches SYSVOL files for hardcoded passwords, credentials, and sensitive information that could be exploited by attackers with domain access.
+
+### Technical Details
+
+#### Scan Parameters
 ```powershell
-.\Invoke-ADSecurityAudit.ps1 -CheckType PrivilegedGroups -PrivilegedGroupThreshold 3
-```
-Audits only privileged groups with a stricter threshold of 3 members maximum.
-
-### Example 5: Password Security Assessment
-```powershell
-.\Invoke-ADSecurityAudit.ps1 -CheckType OldPasswords,PasswordsInDescription,PasswordsInSYSVOL -PasswordAge 60
-```
-Focuses on password-related security issues with a 60-day age threshold.
-
-## Detailed Check Descriptions
-
-### Old Password Check
-- **Purpose**: Identifies accounts with passwords older than the specified threshold
-- **Risk**: Old passwords are more likely to be compromised or weak
-- **Output**: List of accounts with password age and last logon information
-- **Remediation**: Implement password expiration policies and user education
-
-### Kerberoasting Vulnerability Check
-- **Purpose**: Detects service accounts with Service Principal Names (SPNs)
-- **Risk**: These accounts are vulnerable to Kerberoasting attacks
-- **Output**: Service accounts with SPNs, password ages, and enabled status
-- **Remediation**: Use managed service accounts (MSAs) and strong passwords
-
-### Privileged Group Check
-- **Purpose**: Audits membership in high-privilege Active Directory groups
-- **Risk**: Excessive privileged access increases attack surface
-- **Output**: Group membership counts and member details
-- **Remediation**: Implement least privilege access and regular access reviews
-
-### LDAP NULL Bind Check
-- **Purpose**: Tests for anonymous LDAP access capabilities
-- **Risk**: Anonymous access can expose directory information
-- **Output**: Whether anonymous LDAP binding is enabled
-- **Remediation**: Disable anonymous LDAP access in domain controller settings
-
-### Passwords in Description Check
-- **Purpose**: Scans user description fields for potential password exposure
-- **Risk**: Plaintext passwords in descriptions pose immediate security risk
-- **Output**: Users with suspicious description content
-- **Remediation**: Remove passwords from descriptions and educate users
-
-### SYSVOL Password Check
-- **Purpose**: Searches SYSVOL files for hardcoded passwords
-- **Risk**: Scripts and configurations may contain embedded credentials
-- **Output**: Files containing potential password references
-- **Remediation**: Remove hardcoded credentials and use secure alternatives
-
-## Output Format
-
-### Console Output
-The script provides color-coded console output:
-- **Green [+]**: Successful checks or secure configurations
-- **Yellow [!]**: Warnings or potential issues
-- **Red [-]**: Failed checks or security vulnerabilities
-- **Cyan [=]**: Section headers and summary information
-- **White [*]**: General information
-
-### JSON Export Format
-When using `-OutputPath`, results are saved in structured JSON format:
-
-```json
-{
-  "Timestamp": "2025-06-10 14:30:15",
-  "Domain": "contoso.com",
-  "ExecutedBy": "security.admin",
-  "Parameters": {
-    "CheckType": ["All"],
-    "PasswordAge": 90,
-    "PrivilegedGroupThreshold": 5,
-    "Interactive": false
-  },
-  "Results": {
-    "OldPasswords": {
-      "Status": "Fail",
-      "Message": "Found 12 accounts with passwords older than 90 days",
-      "Details": [...],
-      "Timestamp": "2025-06-10 14:30:45"
-    }
-  },
-  "Summary": {
-    "TotalChecks": 6,
-    "PassedChecks": 2,
-    "FailedChecks": 3,
-    "Warnings": 1,
-    "ExecutionTime": "00:02:34.156"
-  }
-}
+$fileExtensions = @('*.xml', '*.txt', '*.ini', '*.cfg', '*.conf', '*.bat', '*.cmd', '*.ps1', '*.vbs')
+$passwordPatterns = @('password', 'pwd', 'pass', 'cpassword')
 ```
 
-## Requirements
+#### File Analysis Process
+1. Enumerate SYSVOL share structure
+2. Filter files by extension and accessibility
+3. Content analysis using pattern matching
+4. Context extraction around matches
+5. Risk assessment based on file type and content
 
-### System Requirements
-- **Operating System**: Windows 10/11, Windows Server 2016+
-- **PowerShell**: Version 5.1 or higher (PowerShell 7+ recommended)
-- **Modules**: Active Directory PowerShell module
-- **Network**: Connectivity to domain controllers
-
-### Permissions Required
-- **Minimum**: Domain User account
-- **Recommended**: Account with the following delegated permissions:
-  - Read all user objects and properties
-  - Read group membership
-  - Access to SYSVOL share
-  - LDAP query permissions
-
-### Installation Prerequisites
-```powershell
-# Install Active Directory module (if not already installed)
-Install-WindowsFeature -Name RSAT-AD-PowerShell
-
-# Or on Windows 10/11
-Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0
-```
-
-## Performance Considerations
-
-### Large Environments
-For environments with >10,000 users:
-- Use specific check types rather than "All"
-- Disable progress bars with `-ShowProgress:$false`
-- Run during off-peak hours
-- Consider running from a domain controller for better performance
-
-### Memory Usage
-- Script uses minimal memory footprint
-- Large result sets are processed incrementally
-- JSON export may require additional memory for serialization
-
-### Network Impact
-- Uses efficient LDAP queries with appropriate filters
-- Minimal network traffic for most checks
-- SYSVOL check generates more network I/O
-
-## Error Handling
-
-The script implements comprehensive error handling:
-- **Module Import Errors**: Script exits gracefully if AD module unavailable
-- **Permission Errors**: Individual check failures don't stop other checks
-- **Network Errors**: Timeout and retry logic for network operations
-- **File Access Errors**: Proper handling of inaccessible SYSVOL files
-
-## Security Considerations
-
-### Data Sensitivity
-- Script output may contain sensitive information
-- JSON exports should be stored securely
-- Consider redacting sensitive details in shared reports
-
-### Execution Security
-- Script follows PowerShell security best practices
-- No credential handling or storage
-- Uses read-only operations where possible
-- Validates all user inputs
-
-## Troubleshooting
-
-### Common Issues
-
-**"Access Denied" Errors**
-```
-Cause: Insufficient permissions to read AD objects
-Solution: Verify account has Domain User privileges minimum
-```
-
-**"Module Not Found" Errors**
-```
-Cause: Active Directory PowerShell module not installed
-Solution: Install RSAT tools or AD management features
-```
-
-**SYSVOL Access Issues**
-```
-Cause: Network connectivity or share permission issues
-Solution: Verify SYSVOL share accessibility and permissions
-```
-
-**Performance Issues**
-```
-Cause: Large environment or network latency
-Solution: Use targeted checks and disable progress indicators
-```
-
-### Debug Information
-Enable debug output for troubleshooting:
-```powershell
-.\Invoke-ADSecurityAudit.ps1 -Debug -Verbose
-```
-
-## Version History
-
-- **v2.0.0**: Complete rewrite with enhanced features and professional output
-- **v1.0.0**: Initial version with basic security checks
-
-## Related Files
-
-- `SECURITY_CHECKS.md`: Detailed technical information about each security check
-- `REMEDIATION_GUIDE.md`: Step-by-step remediation procedures
-- `examples/`: Sample usage scenarios and output examples
+#### Common Findings
+| File Type | Risk Level | Common Content |
+|-----------|------------|----------------|
+| Group Policy XML | Critical | Encrypted passwords (reversible) |
