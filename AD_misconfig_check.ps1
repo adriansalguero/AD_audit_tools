@@ -46,7 +46,7 @@
 
 .NOTES
     Version:        2.0.0
-    Author:         Security Professional
+    Author:         Adrian Salguero
     Creation Date:  2025-06-10
     Purpose:        Active Directory Security Assessment
     
